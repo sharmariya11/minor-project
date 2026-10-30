@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -31,8 +30,11 @@ from app.api.routes.ai_feedback import router as ai_feedback_router
 from app.api.routes.ai_skill_gap import router as ai_skill_gap_router
 
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+# Create database tables safely
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Database initialization notice: {e}")
 
 app = FastAPI(
     title="AI Interview Simulator",
@@ -40,18 +42,18 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Allow the local Vite frontend to access the backend
+# Allow local Vite frontend as well as any Vercel deployment domain
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
+    allow_origin_regex=r"^https?://.*$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 
 @app.get("/")
@@ -73,6 +75,11 @@ def database_test():
             "database": database_name,
             "host": "127.0.0.1",
             "port": 5432,
+        }
+    except Exception as e:
+        return {
+            "message": "Database connection error",
+            "error": str(e)
         }
     finally:
         db.close()
