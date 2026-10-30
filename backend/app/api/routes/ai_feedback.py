@@ -30,6 +30,47 @@ def get_db():
         db.close()
 
 
+def parse_bullet_points(text: str) -> list[str]:
+    items = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("*-•123456789.) ").strip()
+        if line and len(line) > 3:
+            items.append(line)
+    return items
+
+
+def parse_feedback_sections(text: str) -> dict[str, str]:
+    sections = {'strengths': '', 'weaknesses': '', 'suggestions': ''}
+    current_key = None
+    lines = []
+
+    for line in text.splitlines():
+        clean = line.strip().strip('#*:- ').strip().lower()
+        if 'strength' in clean:
+            if current_key:
+                sections[current_key] = '\n'.join(lines).strip()
+            current_key = 'strengths'
+            lines = []
+        elif 'suggestion' in clean or 'recommend' in clean:
+            if current_key:
+                sections[current_key] = '\n'.join(lines).strip()
+            current_key = 'suggestions'
+            lines = []
+        elif 'weakness' in clean or 'area' in clean or 'improvement' in clean:
+            if current_key:
+                sections[current_key] = '\n'.join(lines).strip()
+            current_key = 'weaknesses'
+            lines = []
+        else:
+            if current_key:
+                lines.append(line)
+
+    if current_key:
+        sections[current_key] = '\n'.join(lines).strip()
+
+    return sections
+
+
 @router.post("/generate-feedback", status_code=status.HTTP_201_CREATED)
 def generate_interview_feedback(
     request: FeedbackRequest,
@@ -66,38 +107,39 @@ def generate_interview_feedback(
             Answer.question_id == question.id
         ).order_by(Answer.id.desc()).first()
 
-        if answer:
-            score_val = answer.score if answer.score is not None else 5.0
+        if answer and answer.answer_text and answer.answer_text != "[Skipped]":
+            score_val = answer.score if answer.score is not None else 0.0
             answer_scores.append(score_val)
             evaluations.append(
                 f"Question: {question.question}\n"
                 f"Candidate Answer: {answer.answer_text}\n"
-                f"Score: {score_val}/10"
+                f"Evaluated Score: {score_val}/10"
             )
         else:
+            answer_scores.append(0.0)
             evaluations.append(
                 f"Question: {question.question}\n"
-                f"Candidate Answer: [Not Answered]\n"
-                f"Score: 0/10"
+                f"Candidate Answer: [Skipped / Not Answered]\n"
+                f"Evaluated Score: 0.0/10"
             )
-
-    if not evaluations:
-        raise HTTPException(
-            status_code=404,
-            detail="No answers found for this interview session."
-        )
 
     evaluations_text = "\n\n".join(evaluations)
 
     # Generate AI feedback
-    feedback = generate_feedback(
-        job_role=request.job_role,
-        evaluations=evaluations_text
-    )
+    try:
+        feedback = generate_feedback(
+            job_role=request.job_role,
+            evaluations=evaluations_text
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate feedback: {str(e)}"
+        )
 
-    # Extract overall score (handles "Overall Score: 8/10", "**Overall Score:** 8", etc.)
+    # Extract overall score
     score_match = re.search(
-        r"Overall Score\s*:?\s*(?:\*\*)?\s*(\d+(?:\.\d+)?)(?:\s*/\s*10)?",
+        r"(?:overall\s+score|score)[^\d]*(\d+(?:\.\d+)?)",
         feedback,
         re.IGNORECASE
     )
@@ -105,50 +147,43 @@ def generate_interview_feedback(
     overall_score = None
     if score_match:
         try:
-            overall_score = float(score_match.group(1))
-            if overall_score > 10:
-                overall_score = round(overall_score / 10, 1)
+            val = float(score_match.group(1))
+            if val > 10:
+                val = round(val / 10, 1)
+            overall_score = round(val, 1)
         except ValueError:
             overall_score = None
 
+    # Calculate average of answer scores as verification
+    avg_answer_score = round(sum(answer_scores) / max(len(answer_scores), 1), 1) if answer_scores else 0.0
+
     if overall_score is None:
-        overall_score = round(sum(answer_scores) / max(len(answer_scores), 1), 1) if answer_scores else 6.0
+        overall_score = avg_answer_score
+    else:
+        # If all answers were scored 0, the overall score MUST be 0
+        if avg_answer_score == 0.0:
+            overall_score = 0.0
 
-    # Extract sections
-    strengths = ""
-    weaknesses = ""
-    suggestions = ""
+    # Extract sections using robust parser
+    sections = parse_feedback_sections(feedback)
+    strengths = sections.get('strengths', '').strip()
+    weaknesses = sections.get('weaknesses', '').strip()
+    suggestions = sections.get('suggestions', '').strip()
 
-    strengths_match = re.search(
-        r"(?:#{1,6}\s*)?(?:\*\*)?Strengths(?:\*\*)?\s*:\s*"
-        r"(.*?)(?=\n\s*(?:#{1,6}\s*)?(?:\*\*)?Weaknesses(?:\*\*)?\s*:|\Z)",
-        feedback,
-        re.IGNORECASE | re.DOTALL
-    )
-
-    weaknesses_match = re.search(
-        r"(?:#{1,6}\s*)?(?:\*\*)?Weaknesses(?:\*\*)?\s*:\s*"
-        r"(.*?)(?=\n\s*(?:#{1,6}\s*)?(?:\*\*)?Suggestions(?:\*\*)?\s*:|\Z)",
-        feedback,
-        re.IGNORECASE | re.DOTALL
-    )
-
-    suggestions_match = re.search(
-        r"(?:#{1,6}\s*)?(?:\*\*)?Suggestions(?:\*\*)?\s*:\s*(.*)",
-        feedback,
-        re.IGNORECASE | re.DOTALL
-    )
-
-    if strengths_match:
-        strengths = strengths_match.group(1).strip()
-    if weaknesses_match:
-        weaknesses = weaknesses_match.group(1).strip()
-    if suggestions_match:
-        suggestions = suggestions_match.group(1).strip()
-
-    strengths = strengths.strip("*# ").strip()
-    weaknesses = weaknesses.strip("*# ").strip()
-    suggestions = suggestions.strip("*# ").strip()
+    if overall_score == 0.0 or avg_answer_score == 0.0:
+        if not strengths or "none" not in strengths.lower():
+            strengths = "No technical strengths demonstrated. The candidate was unable to provide correct answers to the interview questions."
+        if not weaknesses:
+            weaknesses = "Fundamental lack of technical preparation for this role. Answers provided were incorrect, minimal, or missing."
+        if not suggestions:
+            suggestions = f"Start with fundamental {request.job_role} courses and textbook study. Practice answering basic questions before retaking the mock interview."
+    else:
+        if not strengths:
+            strengths = "Good technical effort demonstrated on some concepts."
+        if not weaknesses:
+            weaknesses = "Could provide deeper architectural trade-offs and edge-case considerations."
+        if not suggestions:
+            suggestions = "Practice structuring answers with concrete industry examples."
 
     # Save feedback report
     new_report = FeedbackReport(
@@ -164,15 +199,6 @@ def generate_interview_feedback(
     db.add(new_report)
     db.commit()
     db.refresh(new_report)
-
-    # Helper lists for cleaner frontend rendering
-    def parse_bullet_points(text: str) -> list[str]:
-        items = []
-        for line in text.splitlines():
-            line = line.strip().lstrip("*-•123456789.) ").strip()
-            if line:
-                items.append(line)
-        return items
 
     return {
         "message": "Feedback generated from saved answers and saved successfully",

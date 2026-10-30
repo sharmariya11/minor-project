@@ -1,10 +1,12 @@
+from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
 
 
 class InterviewSessionCreate(BaseModel):
-    user_id: int
-    job_role_id: int
+    user_id: Optional[int] = 1
+    job_role_id: Optional[int] = None
+    job_role: Optional[str] = None
 
 
 class InterviewSessionResponse(BaseModel):
