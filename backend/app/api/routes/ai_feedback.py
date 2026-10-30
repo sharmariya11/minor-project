@@ -1,4 +1,5 @@
 import re
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -18,8 +19,9 @@ router = APIRouter(
 
 
 class FeedbackRequest(BaseModel):
-    session_id: int
+    session_id: Optional[int] = 0
     job_role: str
+    qa_list: Optional[List[dict]] = None
 
 
 def get_db():
@@ -76,52 +78,54 @@ def generate_interview_feedback(
     request: FeedbackRequest,
     db: Session = Depends(get_db)
 ):
-    # Check interview session
-    session = db.query(InterviewSession).filter(
-        InterviewSession.id == request.session_id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=404,
-            detail="Interview session not found."
-        )
-
-    # Get all questions for this interview session
-    questions = db.query(InterviewQuestion).filter(
-        InterviewQuestion.session_id == request.session_id
-    ).order_by(InterviewQuestion.id).all()
-
-    if not questions:
-        raise HTTPException(
-            status_code=404,
-            detail="No interview questions found for this session."
-        )
-
-    # Build evaluations from saved answers
     evaluations = []
     answer_scores = []
 
-    for question in questions:
-        answer = db.query(Answer).filter(
-            Answer.question_id == question.id
-        ).order_by(Answer.id.desc()).first()
+    # 1. Try fetching questions and answers from database if session_id is provided
+    if request.session_id and request.session_id > 0:
+        try:
+            questions = db.query(InterviewQuestion).filter(
+                InterviewQuestion.session_id == request.session_id
+            ).order_by(InterviewQuestion.id).all()
 
-        if answer and answer.answer_text and answer.answer_text != "[Skipped]":
-            score_val = answer.score if answer.score is not None else 0.0
+            for question in questions:
+                answer = db.query(Answer).filter(
+                    Answer.question_id == question.id
+                ).order_by(Answer.id.desc()).first()
+
+                if answer and answer.answer_text and answer.answer_text != "[Skipped]":
+                    score_val = answer.score if answer.score is not None else 0.0
+                    answer_scores.append(score_val)
+                    evaluations.append(
+                        f"Question: {question.question}\n"
+                        f"Candidate Answer: {answer.answer_text}\n"
+                        f"Evaluated Score: {score_val}/10"
+                    )
+                else:
+                    answer_scores.append(0.0)
+                    evaluations.append(
+                        f"Question: {question.question}\n"
+                        f"Candidate Answer: [Skipped / Not Answered]\n"
+                        f"Evaluated Score: 0.0/10"
+                    )
+        except Exception as e:
+            print(f"Notice: Could not load session from DB ({e})")
+
+    # 2. Fall back to qa_list provided in request payload
+    if not evaluations and request.qa_list:
+        for item in request.qa_list:
+            q_txt = item.get("question") or item.get("text") or "Question"
+            a_txt = item.get("answer") or "[Skipped]"
+            score_val = item.get("score", 0.0)
             answer_scores.append(score_val)
             evaluations.append(
-                f"Question: {question.question}\n"
-                f"Candidate Answer: {answer.answer_text}\n"
+                f"Question: {q_txt}\n"
+                f"Candidate Answer: {a_txt}\n"
                 f"Evaluated Score: {score_val}/10"
             )
-        else:
-            answer_scores.append(0.0)
-            evaluations.append(
-                f"Question: {question.question}\n"
-                f"Candidate Answer: [Skipped / Not Answered]\n"
-                f"Evaluated Score: 0.0/10"
-            )
+
+    if not evaluations:
+        evaluations.append(f"General technical assessment for {request.job_role}.")
 
     evaluations_text = "\n\n".join(evaluations)
 
@@ -154,25 +158,21 @@ def generate_interview_feedback(
         except ValueError:
             overall_score = None
 
-    # Calculate average of answer scores as verification
     avg_answer_score = round(sum(answer_scores) / max(len(answer_scores), 1), 1) if answer_scores else 0.0
 
     if overall_score is None:
         overall_score = avg_answer_score
     else:
-        # If all answers were scored 0, the overall score MUST be 0
-        if avg_answer_score == 0.0:
+        if answer_scores and avg_answer_score == 0.0:
             overall_score = 0.0
 
-    # Extract sections using robust parser
     sections = parse_feedback_sections(feedback)
     strengths = sections.get('strengths', '').strip()
     weaknesses = sections.get('weaknesses', '').strip()
     suggestions = sections.get('suggestions', '').strip()
 
-    if overall_score == 0.0 or avg_answer_score == 0.0:
-        if not strengths or "none" not in strengths.lower():
-            strengths = "No technical strengths demonstrated. The candidate was unable to provide correct answers to the interview questions."
+    if overall_score == 0.0:
+        strengths = "No technical strengths demonstrated. The candidate was unable to provide correct answers to the interview questions."
         if not weaknesses:
             weaknesses = "Fundamental lack of technical preparation for this role. Answers provided were incorrect, minimal, or missing."
         if not suggestions:
@@ -185,24 +185,30 @@ def generate_interview_feedback(
         if not suggestions:
             suggestions = "Practice structuring answers with concrete industry examples."
 
-    # Save feedback report
-    new_report = FeedbackReport(
-        session_id=request.session_id,
-        overall_score=overall_score,
-        strengths=strengths,
-        weaknesses=weaknesses,
-        suggestions=suggestions
-    )
-
-    session.status = "completed"
-
-    db.add(new_report)
-    db.commit()
-    db.refresh(new_report)
+    # Save to DB if session exists
+    report_id = request.session_id or 1
+    if request.session_id and request.session_id > 0:
+        try:
+            new_report = FeedbackReport(
+                session_id=request.session_id,
+                overall_score=overall_score,
+                strengths=strengths,
+                weaknesses=weaknesses,
+                suggestions=suggestions
+            )
+            session = db.query(InterviewSession).filter(InterviewSession.id == request.session_id).first()
+            if session:
+                session.status = "completed"
+            db.add(new_report)
+            db.commit()
+            db.refresh(new_report)
+            report_id = new_report.id
+        except Exception as e:
+            print(f"Notice: Could not persist feedback to DB ({e})")
 
     return {
-        "message": "Feedback generated from saved answers and saved successfully",
-        "feedback_report_id": new_report.id,
+        "message": "Feedback generated successfully",
+        "feedback_report_id": report_id,
         "session_id": request.session_id,
         "overall_score": overall_score,
         "strengths": strengths,

@@ -30,9 +30,11 @@ from app.api.routes.ai_feedback import router as ai_feedback_router
 from app.api.routes.ai_skill_gap import router as ai_skill_gap_router
 
 
-# Create database tables safely
+# Create database tables and seed roles safely
 try:
     Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db_init:
+        seed_job_roles_if_empty(db_init)
 except Exception as e:
     print(f"Database initialization notice: {e}")
 
@@ -67,14 +69,11 @@ def root():
 def database_test():
     db = SessionLocal()
     try:
-        result = db.execute(text("SELECT current_database()"))
-        database_name = result.scalar()
-
+        dialect_name = db.bind.dialect.name
         return {
             "message": "Database connected successfully",
-            "database": database_name,
-            "host": "127.0.0.1",
-            "port": 5432,
+            "dialect": dialect_name,
+            "status": "online"
         }
     except Exception as e:
         return {

@@ -16,7 +16,7 @@ import {
   getRecommendations,
   isNonAnswer,
 } from '../services/api';
-import { addInterviewRecord, setLastResult, getAuthUser } from '../utils/storage';
+import { addInterviewRecord, setLastResult, getAuthUser, getInterviewHistory } from '../utils/storage';
 
 export default function Interview() {
   const navigate = useNavigate();
@@ -51,8 +51,22 @@ export default function Interview() {
       const authUser = getAuthUser();
       const userId = authUser?.id || 1;
 
+      // Extract previously asked questions from past attempts so questions are NEVER repeated
+      const history = getInterviewHistory();
+      const pastQuestions = [];
+      for (const h of history) {
+        if (Array.isArray(h.answers)) {
+          for (const a of h.answers) {
+            const q = a?.question;
+            if (q && typeof q === 'string' && !pastQuestions.includes(q)) {
+              pastQuestions.push(q);
+            }
+          }
+        }
+      }
+
       try {
-        // Step 1: Create backend interview session in PostgreSQL
+        // Step 1: Create backend interview session
         const session = await createBackendSession({
           userId,
           roleId,
@@ -62,12 +76,13 @@ export default function Interview() {
         const activeSessionId = session?.id || Math.floor(Date.now() / 1000);
         if (isMounted) setSessionId(activeSessionId);
 
-        // Step 2: Generate dynamic AI questions via Groq LLM
+        // Step 2: Generate dynamic AI questions via Groq LLM (avoiding past questions)
         const aiQuestions = await generateAIQuestions({
           sessionId: activeSessionId,
           jobRole: role.name,
           difficulty: role.difficulty || 'Medium',
           count: 5,
+          avoidQuestions: pastQuestions,
         });
 
         if (isMounted) {
@@ -75,10 +90,11 @@ export default function Interview() {
           setLoadingQuestions(false);
         }
       } catch (err) {
-        console.error('Failed to initialize AI interview:', err);
+        console.warn('Backend init notice, generating dynamic questions:', err);
         const fallback = await generateAIQuestions({
-          sessionId: null,
+          sessionId: Math.floor(Date.now() / 1000),
           jobRole: role.name,
+          avoidQuestions: pastQuestions,
         });
         if (isMounted) {
           setQuestions(fallback);
@@ -134,21 +150,21 @@ export default function Interview() {
 
   const storeAnswer = (text) => {
     const currentQ = questions[current];
+    const qText = currentQ?.text || currentQ || '';
     const updated = [...answers];
     updated[current] = {
       questionId: currentQ?.id,
-      question: currentQ?.text || currentQ,
+      question: qText,
       answer: text,
     };
     setAnswers(updated);
 
-    // Save answer evaluation in background to backend PostgreSQL
-    if (currentQ?.id && typeof currentQ.id === 'number') {
-      evaluateAIAnswer({
-        questionId: currentQ.id,
-        answer: text,
-      }).catch((err) => console.warn('Background answer evaluation error:', err));
-    }
+    // Save answer evaluation in background
+    evaluateAIAnswer({
+      questionId: currentQ?.id,
+      questionText: qText,
+      answer: text,
+    }).catch((err) => console.warn('Background evaluation notice:', err));
 
     return updated;
   };
@@ -180,17 +196,16 @@ export default function Interview() {
 
     const allAnswers = providedAnswers || answers;
 
-    // Ensure all answers are evaluated and saved to DB
+    // Send any remaining evaluations
     for (const ansItem of allAnswers) {
-      if (ansItem?.questionId && typeof ansItem.questionId === 'number') {
-        try {
-          await evaluateAIAnswer({
-            questionId: ansItem.questionId,
-            answer: ansItem.answer || '',
-          });
-        } catch (e) {
-          // ignore evaluation error
-        }
+      try {
+        await evaluateAIAnswer({
+          questionId: ansItem?.questionId,
+          questionText: ansItem?.question,
+          answer: ansItem?.answer || '',
+        });
+      } catch (e) {
+        // ignore evaluation notice
       }
     }
 
@@ -198,16 +213,23 @@ export default function Interview() {
     let aiFeedbackData = null;
     let aiSkillGapData = null;
 
-    if (sessionId) {
-      try {
-        setStatusMessage('AI synthesizing final performance report...');
-        aiFeedbackData = await generateAIFeedback({ sessionId, jobRole: role.name });
+    try {
+      setStatusMessage('AI synthesizing comprehensive performance report...');
+      const formattedQA = allAnswers.map((a) => ({
+        question: a.question || '',
+        answer: a.answer || '',
+      }));
 
-        setStatusMessage('AI determining skill gaps and learning resources...');
-        aiSkillGapData = await analyzeAISkillGap({ sessionId, jobRole: role.name });
-      } catch (err) {
-        console.warn('Backend AI analysis error, using client-side fallback:', err);
-      }
+      aiFeedbackData = await generateAIFeedback({
+        sessionId,
+        jobRole: role.name,
+        qaList: formattedQA,
+      });
+
+      setStatusMessage('AI determining skill gaps and learning resources...');
+      aiSkillGapData = await analyzeAISkillGap({ sessionId, jobRole: role.name });
+    } catch (err) {
+      console.warn('Backend AI analysis notice, using client-side fallback:', err);
     }
 
     // Check if every answer is empty or a non-answer
@@ -223,7 +245,7 @@ export default function Interview() {
       overallScore = fallbackScores.overall;
     }
 
-    // If candidate gave no real answers or admitted not knowing all of them, enforce 0%
+    // If candidate gave no real answers, strictly enforce 0%
     if (!hasAnyRealAnswer) {
       overallScore = 0;
     }
