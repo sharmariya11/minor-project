@@ -22,7 +22,7 @@ async function safeFetch(path, options = {}) {
 }
 
 /**
- * Creates an interview session in PostgreSQL backend
+ * Creates an interview session in backend
  */
 export async function createBackendSession({ userId = 1, roleId, roleTitle }) {
   const payload = {
@@ -39,17 +39,18 @@ export async function createBackendSession({ userId = 1, roleId, roleTitle }) {
 }
 
 /**
- * Generates fresh questions via backend Groq LLM and saves to PostgreSQL
+ * Generates fresh questions via backend Groq LLM (with dynamic shuffled fallback)
  */
-export async function generateAIQuestions({ sessionId, jobRole, difficulty = 'Medium', count = 5 }) {
-  if (sessionId) {
+export async function generateAIQuestions({ sessionId, jobRole, difficulty = 'Medium', count = 5, avoidQuestions = [] }) {
+  try {
     const data = await safeFetch('/ai/generate-questions', {
       method: 'POST',
       body: JSON.stringify({
-        session_id: sessionId,
+        session_id: sessionId || 0,
         job_role: jobRole,
         difficulty,
         count,
+        avoid_questions: avoidQuestions,
       }),
     });
 
@@ -57,34 +58,33 @@ export async function generateAIQuestions({ sessionId, jobRole, difficulty = 'Me
       return data.questions.map((q) => ({
         id: q.id,
         text: q.question,
-        difficulty: q.difficulty,
-        type: q.question_type,
+        difficulty: q.difficulty || difficulty,
+        type: q.question_type || 'AI Generated',
       }));
     }
+  } catch (err) {
+    console.warn('Backend question generator call notice:', err);
   }
 
-  // Graceful offline fallback
-  const fallback = getQuestionsForRole(jobRole);
+  // Dynamic shuffled fallback
+  const fallback = getQuestionsForRole(jobRole, count, avoidQuestions);
   return fallback.map((qText, i) => ({
-    id: `local-${i}-${Date.now()}`,
+    id: `local-${Date.now()}-${i}`,
     text: qText,
     difficulty,
-    type: 'Bank Question',
+    type: 'Curated Question',
   }));
 }
 
 /**
  * Evaluates an individual answer with Groq LLM and saves to DB
  */
-export async function evaluateAIAnswer({ questionId, answer }) {
-  if (!questionId || typeof questionId !== 'number') {
-    return null;
-  }
-
+export async function evaluateAIAnswer({ questionId, questionText, answer }) {
   return await safeFetch('/ai/evaluate-answer', {
     method: 'POST',
     body: JSON.stringify({
-      question_id: questionId,
+      question_id: typeof questionId === 'number' ? questionId : 1,
+      question_text: questionText || '',
       answer: answer || '',
     }),
   });
@@ -93,28 +93,25 @@ export async function evaluateAIAnswer({ questionId, answer }) {
 /**
  * Generates overall interview feedback report via backend Groq LLM
  */
-export async function generateAIFeedback({ sessionId, jobRole }) {
-  if (!sessionId) return null;
-
+export async function generateAIFeedback({ sessionId, jobRole, qaList }) {
   return await safeFetch('/ai/generate-feedback', {
     method: 'POST',
     body: JSON.stringify({
-      session_id: sessionId,
+      session_id: sessionId || 0,
       job_role: jobRole,
+      qa_list: qaList || [],
     }),
   });
 }
 
 /**
- * Analyzes skill gaps via backend Groq LLM and saves to PostgreSQL
+ * Analyzes skill gaps via backend Groq LLM and saves to DB
  */
 export async function analyzeAISkillGap({ sessionId, jobRole }) {
-  if (!sessionId) return null;
-
   return await safeFetch('/ai/analyze-skill-gap', {
     method: 'POST',
     body: JSON.stringify({
-      session_id: sessionId,
+      session_id: sessionId || 0,
       job_role: jobRole,
     }),
   });
@@ -181,7 +178,6 @@ export function generateScores(answers = []) {
   const ratio = validAnswers.length / answers.length;
   const avgLen = validAnswers.reduce((sum, a) => sum + (a.answer?.length || 0), 0) / validAnswers.length;
 
-  // Base score proportional to how many questions were meaningfully attempted
   const baseScore = ratio * 50;
   const depthBonus = Math.min(avgLen / 10, 30);
   const overall = clamp(baseScore + depthBonus);
